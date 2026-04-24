@@ -19,6 +19,7 @@ from .view_hybrid import HybridLowPassView, HybridHighPassView, \
 from .view_color import ColorView, GrayscaleView
 from .view_motion import MotionBlurResView, MotionBlurView
 from .view_scale import ScaleView
+from .view_cylindrical import CylindricalMirrorView
 
 VIEW_MAP = {
     'identity': IdentityView,
@@ -46,6 +47,7 @@ VIEW_MAP = {
     'motion': MotionBlurView,
     'motion_res': MotionBlurResView,
     'scale': ScaleView,
+    'cylindrical': CylindricalMirrorView,
 }
 
 def get_views(view_names, view_args=None):
@@ -68,6 +70,19 @@ def get_views(view_names, view_args=None):
             args = [2.0 if view_arg is None else float(view_arg)]
         elif view_name in ['scale']:
             args = [0.5 if view_arg is None else float(view_arg)]
+        elif view_name == 'cylindrical':
+            if view_arg is None:
+                args = [0.2, 180.0]
+            else:
+                parts = [p.strip() for p in str(view_arg).split(',') if p.strip()]
+                if len(parts) == 1:
+                    args = [float(parts[0]), 180.0]
+                elif len(parts) == 2:
+                    args = [float(parts[0]), float(parts[1])]
+                else:
+                    raise ValueError(
+                        "Cylindrical view expects `radius_ratio[,theta_deg]` as view_arg."
+                    )
         else:
             args = []
 
