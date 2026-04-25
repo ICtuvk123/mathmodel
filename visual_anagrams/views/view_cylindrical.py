@@ -233,6 +233,9 @@ class CylindricalMirrorView(BaseView):
             return inverted, coverage
         return inverted
 
+    def uses_clean_sync(self):
+        return True
+
     def get_valid_mask(self, size, device, dtype):
         coverage = self._get_inverse_cache(size, device, dtype)['coverage']
         return (coverage > 0).to(dtype)

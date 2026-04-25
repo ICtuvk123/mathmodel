@@ -56,6 +56,13 @@ class BaseView:
         '''
         return 1.0
 
+    def uses_clean_sync(self):
+        '''
+        Whether this view should use LookingGlass-style clean-image
+        synchronization instead of the legacy noise-space aggregation.
+        '''
+        return False
+
     def make_frame(self, im, t):
         '''
         Make a frame, transitioning linearly from the identity view (t=0) 

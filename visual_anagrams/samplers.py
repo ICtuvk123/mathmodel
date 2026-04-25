@@ -194,6 +194,50 @@ def _time_travel_passes(step_idx,
     return 1
 
 
+def _use_clean_sync(views):
+    return any(view.uses_clean_sync() for view in views)
+
+
+def _legacy_reduce_noise_predictions(noise_pred_uncond,
+                                     noise_pred_text,
+                                     views,
+                                     reduction,
+                                     step_idx,
+                                     guidance_scale,
+                                     sample_channels,
+                                     spatial_size):
+    inverted_preds = []
+    for pred, view in zip(noise_pred_uncond, views):
+        inverted_preds.append(view.inverse_view(pred))
+    noise_pred_uncond = torch.stack(inverted_preds)
+
+    inverted_preds = []
+    for pred, view in zip(noise_pred_text, views):
+        inverted_preds.append(view.inverse_view(pred))
+    noise_pred_text = torch.stack(inverted_preds)
+
+    noise_pred_uncond, _ = noise_pred_uncond.split(sample_channels, dim=1)
+    noise_pred_text, predicted_variance = noise_pred_text.split(sample_channels, dim=1)
+    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+    num_prompts = len(views)
+    noise_pred = noise_pred.view(-1, num_prompts, sample_channels, spatial_size, spatial_size)
+    predicted_variance = predicted_variance.view(-1, num_prompts, sample_channels, spatial_size, spatial_size)
+    if reduction == 'mean':
+        noise_pred = noise_pred.mean(1)
+        predicted_variance = predicted_variance.mean(1)
+    elif reduction == 'sum':
+        noise_pred = noise_pred.sum(1)
+        predicted_variance = predicted_variance.mean(1)
+    elif reduction == 'alternate':
+        noise_pred = noise_pred[:, step_idx % num_prompts]
+        predicted_variance = predicted_variance[:, step_idx % num_prompts]
+    else:
+        raise ValueError('Reduction must be either `mean`, `sum`, or `alternate`')
+
+    return torch.cat([noise_pred, predicted_variance], dim=1)
+
+
 def _renoise_from_clean(scheduler, clean_image, timestep, generator):
     clean_image = _stabilize_clean_sample(scheduler, clean_image)
     sqrt_alpha_prod_t, sqrt_beta_prod_t = _alpha_terms(scheduler, timestep, clean_image[0])
@@ -254,9 +298,15 @@ def sample_stage_1(model,
         ref_im = ref_im.to(noisy_images.device).to(noisy_images.dtype)
 
     total_steps = len(timesteps)
+    use_clean_sync = _use_clean_sync(views)
     for i, t in enumerate(tqdm(timesteps)):
         passes = _time_travel_passes(
-            i, total_steps, enable_time_travel, time_travel_start, time_travel_end, time_travel_repeats
+            i,
+            total_steps,
+            enable_time_travel and use_clean_sync,
+            time_travel_start,
+            time_travel_end,
+            time_travel_repeats,
         )
         for pass_idx in range(passes):
             # If solving an inverse problem, then project x_t so
@@ -287,24 +337,37 @@ def sample_stage_1(model,
             )[0]
 
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-            noise_pred, synced_clean = _sync_clean_prediction(
-                noisy_images,
-                viewed_noisy_images,
-                noise_pred_uncond,
-                noise_pred_text,
-                views,
-                model.scheduler,
-                t,
-                guidance_scale,
-                reduction,
-                i,
-                total_steps,
-            )
+            if use_clean_sync:
+                noise_pred, synced_clean = _sync_clean_prediction(
+                    noisy_images,
+                    viewed_noisy_images,
+                    noise_pred_uncond,
+                    noise_pred_text,
+                    views,
+                    model.scheduler,
+                    t,
+                    guidance_scale,
+                    reduction,
+                    i,
+                    total_steps,
+                )
+            else:
+                noise_pred = _legacy_reduce_noise_predictions(
+                    noise_pred_uncond,
+                    noise_pred_text,
+                    views,
+                    reduction,
+                    i,
+                    guidance_scale,
+                    noisy_images.shape[1],
+                    height,
+                )
+                synced_clean = None
 
             next_noisy_images = model.scheduler.step(
                 noise_pred, t, noisy_images, generator=generator, return_dict=False
             )[0]
-            if pass_idx + 1 < passes:
+            if synced_clean is not None and pass_idx + 1 < passes:
                 noisy_images = _renoise_from_clean(model.scheduler, synced_clean, t, generator)
             else:
                 noisy_images = next_noisy_images
@@ -379,9 +442,15 @@ def sample_stage_2(model,
 
     # Denoising Loop
     total_steps = len(timesteps)
+    use_clean_sync = _use_clean_sync(views)
     for i, t in enumerate(tqdm(timesteps)):
         passes = _time_travel_passes(
-            i, total_steps, enable_time_travel, time_travel_start, time_travel_end, time_travel_repeats
+            i,
+            total_steps,
+            enable_time_travel and use_clean_sync,
+            time_travel_start,
+            time_travel_end,
+            time_travel_repeats,
         )
         for pass_idx in range(passes):
             if ref_im is not None:
@@ -414,24 +483,37 @@ def sample_stage_2(model,
             )[0]
 
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-            noise_pred, synced_clean = _sync_clean_prediction(
-                noisy_images,
-                viewed_noisy_images,
-                noise_pred_uncond,
-                noise_pred_text,
-                views,
-                model.scheduler,
-                t,
-                guidance_scale,
-                reduction,
-                i,
-                total_steps,
-            )
+            if use_clean_sync:
+                noise_pred, synced_clean = _sync_clean_prediction(
+                    noisy_images,
+                    viewed_noisy_images,
+                    noise_pred_uncond,
+                    noise_pred_text,
+                    views,
+                    model.scheduler,
+                    t,
+                    guidance_scale,
+                    reduction,
+                    i,
+                    total_steps,
+                )
+            else:
+                noise_pred = _legacy_reduce_noise_predictions(
+                    noise_pred_uncond,
+                    noise_pred_text,
+                    views,
+                    reduction,
+                    i,
+                    guidance_scale,
+                    noisy_images.shape[1],
+                    height,
+                )
+                synced_clean = None
 
             next_noisy_images = model.scheduler.step(
                 noise_pred, t, noisy_images, generator=generator, return_dict=False
             )[0]
-            if pass_idx + 1 < passes:
+            if synced_clean is not None and pass_idx + 1 < passes:
                 noisy_images = _renoise_from_clean(model.scheduler, synced_clean, t, generator)
             else:
                 noisy_images = next_noisy_images
