@@ -92,9 +92,8 @@ class LookingGlassCylindricalTests(unittest.TestCase):
 
     def test_identity_weight_ramps_late(self):
         view = IdentityView()
-        self.assertGreaterEqual(view.clean_sync_weight(0.4), 1.0)
+        self.assertEqual(view.clean_sync_weight(0.4), 1.0)
         self.assertGreater(view.clean_sync_weight(0.95), 1.0)
-        self.assertGreater(view.clean_sync_weight(0.95), view.clean_sync_weight(0.4))
 
     def test_time_travel_only_runs_mid_schedule(self):
         self.assertEqual(_time_travel_passes(0, 30, True, 0.2, 0.8, 2), 1)

@@ -12,6 +12,6 @@ class IdentityView(BaseView):
 
     def clean_sync_weight(self, progress):
         if progress <= 0.8:
-            return 3.0
+            return 1.0
         ramp = min(max((progress - 0.8) / 0.2, 0.0), 1.0)
-        return 3.0 + 2.0 * ramp
+        return 1.0 + 1.5 * ramp
