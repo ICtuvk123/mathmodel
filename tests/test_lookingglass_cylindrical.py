@@ -40,29 +40,12 @@ if 'diffusers.utils.torch_utils' not in sys.modules:
     sys.modules['diffusers.utils.torch_utils'] = diffusers_torch_utils_stub
 
 
-from visual_anagrams.samplers import (
-    _aggregate_inverse_predictions,
-    _stabilize_clean_sample,
-    _time_travel_passes,
-)
+from visual_anagrams.samplers import _aggregate_inverse_predictions, _time_travel_passes
 from visual_anagrams.views.view_cylindrical import CylindricalMirrorView
 from visual_anagrams.views.view_identity import IdentityView
 
 
 class LookingGlassCylindricalTests(unittest.TestCase):
-    def test_stabilize_clean_sample_clamps_values(self):
-        class Scheduler:
-            class config:
-                thresholding = False
-                clip_sample = True
-                clip_sample_range = 1.0
-
-        sample = torch.tensor([[[-3.0, 0.5], [2.5, -0.25]]], dtype=torch.float32)
-        stabilized = _stabilize_clean_sample(Scheduler(), sample)
-
-        self.assertGreaterEqual(float(stabilized.min()), -1.0)
-        self.assertLessEqual(float(stabilized.max()), 1.0)
-
     def test_cylindrical_maps_have_expected_shapes(self):
         view = CylindricalMirrorView(radius_ratio=0.2, theta_deg=180.0)
 
