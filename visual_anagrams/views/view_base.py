@@ -33,29 +33,6 @@ class BaseView:
         '''
         raise NotImplementedError()
 
-    def inverse_clean(self, image, return_mask=False):
-        '''
-        Map an image-like tensor from view space back into canonical space.
-
-        By default this reuses `inverse_view` and assumes full coverage.
-        Views with partial coverage or frequency-aware synchronization can
-        override this method.
-        '''
-        inverted = self.inverse_view(image)
-        if return_mask:
-            mask = image.new_ones((1, inverted.shape[-2], inverted.shape[-1]))
-            return inverted, mask
-        return inverted
-
-    def clean_sync_weight(self, progress):
-        '''
-        Relative weight when aggregating clean predictions across views.
-
-        `progress` is in [0,1], where 0 corresponds to the earliest/noisiest
-        denoising step and 1 corresponds to the final/cleanest step.
-        '''
-        return 1.0
-
     def make_frame(self, im, t):
         '''
         Make a frame, transitioning linearly from the identity view (t=0) 

@@ -6,7 +6,6 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 
 from .view_base import BaseView
-from .lpw import blend_lod_pyramid
 
 
 class CylindricalMirrorView(BaseView):
@@ -30,7 +29,6 @@ class CylindricalMirrorView(BaseView):
         self.flip_horizontal = flip_horizontal
         self._view_grid_cache = {}
         self._inverse_cache = {}
-        self._lod_cache = {}
 
     def _cache_key(self, size, device, dtype):
         return (size, str(device), str(dtype))
@@ -119,89 +117,13 @@ class CylindricalMirrorView(BaseView):
             neighbor_indices.append((y_idx[valid] * size + x_idx[valid]).to(torch.long))
             neighbor_weights.append(weight[valid].to(dtype))
 
-        coverage_flat = torch.zeros(size * size, device=device, dtype=dtype)
-        for dst_idx, weight in zip(neighbor_indices, neighbor_weights):
-            if dst_idx.numel() == 0:
-                continue
-            coverage_flat.scatter_add_(0, dst_idx, weight)
-
         cache = {
             'src_neighbor_indices': src_neighbor_indices,
             'dst_flat_indices': neighbor_indices,
             'dst_weights': neighbor_weights,
-            'coverage': coverage_flat.reshape(1, size, size),
         }
         self._inverse_cache[key] = cache
         return cache
-
-    def _get_lod_map(self, size, device, dtype):
-        key = self._cache_key(size, device, dtype)
-        if key in self._lod_cache:
-            return self._lod_cache[key]
-
-        sample_x, sample_y, content, offset = self._build_sampling_coords(size, device, dtype)
-
-        dx_x = torch.zeros_like(sample_x)
-        dx_y = torch.zeros_like(sample_y)
-        dy_x = torch.zeros_like(sample_x)
-        dy_y = torch.zeros_like(sample_y)
-
-        dx_x[:, 1:-1] = (sample_x[:, 2:] - sample_x[:, :-2]) * 0.5
-        dx_y[:, 1:-1] = (sample_y[:, 2:] - sample_y[:, :-2]) * 0.5
-        dy_x[1:-1, :] = (sample_x[2:, :] - sample_x[:-2, :]) * 0.5
-        dy_y[1:-1, :] = (sample_y[2:, :] - sample_y[:-2, :]) * 0.5
-
-        dx_x[:, 0] = sample_x[:, 1] - sample_x[:, 0]
-        dx_y[:, 0] = sample_y[:, 1] - sample_y[:, 0]
-        dx_x[:, -1] = sample_x[:, -1] - sample_x[:, -2]
-        dx_y[:, -1] = sample_y[:, -1] - sample_y[:, -2]
-        dy_x[0, :] = sample_x[1, :] - sample_x[0, :]
-        dy_y[0, :] = sample_y[1, :] - sample_y[0, :]
-        dy_x[-1, :] = sample_x[-1, :] - sample_x[-2, :]
-        dy_y[-1, :] = sample_y[-1, :] - sample_y[-2, :]
-
-        stretch_x = torch.sqrt(dx_x.square() + dx_y.square())
-        stretch_y = torch.sqrt(dy_x.square() + dy_y.square())
-        stretch = torch.maximum(stretch_x, stretch_y).clamp_min(1.0)
-        lod_patch = torch.log2(stretch)
-
-        lod_map = torch.zeros((1, size, size), device=device, dtype=dtype)
-        lod_map[:, offset:offset + content, offset:offset + content] = lod_patch.unsqueeze(0)
-        self._lod_cache[key] = lod_map
-        return lod_map
-
-    def _prefilter_for_inverse(self, image, max_levels=4):
-        _, height, width = image.shape
-        if height != width:
-            raise ValueError("CylindricalMirrorView expects square inputs.")
-
-        lod_map = self._get_lod_map(height, image.device, image.dtype)
-        return blend_lod_pyramid(image, lod_map, max_levels=max_levels)
-
-    def _inverse_scatter(self, tensor):
-        channels, height, width = tensor.shape
-        cache = self._get_inverse_cache(height, tensor.device, tensor.dtype)
-
-        tensor_flat = tensor.reshape(channels, -1)
-        out_flat = torch.zeros_like(tensor_flat)
-
-        for src_idx, dst_idx, weight in zip(
-            cache['src_neighbor_indices'],
-            cache['dst_flat_indices'],
-            cache['dst_weights'],
-        ):
-            if dst_idx.numel() == 0:
-                continue
-            src_vals = tensor_flat[:, src_idx]
-            weighted_vals = src_vals * weight.unsqueeze(0)
-            out_flat.scatter_add_(1, dst_idx.unsqueeze(0).expand(channels, -1), weighted_vals)
-
-        coverage = cache['coverage']
-        valid = coverage.reshape(-1) > 0
-        if valid.any():
-            out_flat[:, valid] = out_flat[:, valid] / coverage.reshape(-1)[valid].unsqueeze(0)
-
-        return out_flat.reshape(channels, height, width), coverage
 
     def view(self, im):
         _, height, width = im.shape
@@ -223,25 +145,29 @@ class CylindricalMirrorView(BaseView):
         if height != width:
             raise ValueError("CylindricalMirrorView expects square inputs.")
 
-        inverted, _ = self._inverse_scatter(noise)
-        return inverted
+        cache = self._get_inverse_cache(height, noise.device, noise.dtype)
 
-    def inverse_clean(self, image, return_mask=False):
-        filtered = self._prefilter_for_inverse(image)
-        inverted, coverage = self._inverse_scatter(filtered)
-        if return_mask:
-            return inverted, coverage
-        return inverted
+        noise_flat = noise.reshape(channels, -1)
+        out_flat = torch.zeros_like(noise_flat)
+        weight_flat = torch.zeros(height * width, device=noise.device, dtype=noise.dtype)
 
-    def get_valid_mask(self, size, device, dtype):
-        coverage = self._get_inverse_cache(size, device, dtype)['coverage']
-        return (coverage > 0).to(dtype)
+        for src_idx, dst_idx, weight in zip(
+            cache['src_neighbor_indices'],
+            cache['dst_flat_indices'],
+            cache['dst_weights'],
+        ):
+            if dst_idx.numel() == 0:
+                continue
+            src_vals = noise_flat[:, src_idx]
+            weighted_vals = src_vals * weight.unsqueeze(0)
+            out_flat.scatter_add_(1, dst_idx.unsqueeze(0).expand(channels, -1), weighted_vals)
+            weight_flat.scatter_add_(0, dst_idx, weight)
 
-    def get_coverage_map(self, size, device, dtype):
-        return self._get_inverse_cache(size, device, dtype)['coverage']
+        valid = weight_flat > 0
+        if valid.any():
+            out_flat[:, valid] = out_flat[:, valid] / weight_flat[valid].unsqueeze(0)
 
-    def get_lod_map(self, size, device, dtype):
-        return self._get_lod_map(size, device, dtype)
+        return out_flat.reshape(channels, height, width)
 
     def save_view(self, im):
         viewed = self.view(im).clone()
