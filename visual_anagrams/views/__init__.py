@@ -50,14 +50,59 @@ VIEW_MAP = {
     'cylindrical': CylindricalMirrorView,
 }
 
+VIEWS_WITH_ARGS = {
+    'patch_permute',
+    'pixel_permute',
+    'skew',
+    'low_pass',
+    'high_pass',
+    'scale',
+    'cylindrical',
+}
+
+
+def _normalize_view_arg(view_arg):
+    if view_arg is None:
+        return None
+    if isinstance(view_arg, str) and view_arg.strip().lower() in {'none', 'null', ''}:
+        return None
+    return view_arg
+
+
+def _align_view_args(view_names, view_args):
+    if view_args is None:
+        return [None for _ in view_names]
+
+    normalized_args = [_normalize_view_arg(arg) for arg in view_args]
+
+    # Positional mode: one arg slot per view.
+    if len(normalized_args) == len(view_names):
+        return normalized_args
+
+    # Compact mode: only views that actually accept args consume them.
+    aligned_args = []
+    arg_idx = 0
+    for view_name in view_names:
+        if view_name in VIEWS_WITH_ARGS and arg_idx < len(normalized_args):
+            aligned_args.append(normalized_args[arg_idx])
+            arg_idx += 1
+        else:
+            aligned_args.append(None)
+
+    if arg_idx != len(normalized_args):
+        raise ValueError(
+            "Too many --view_args values were provided for the selected --views."
+        )
+
+    return aligned_args
+
 def get_views(view_names, view_args=None):
     '''
     Bespoke function to get views (just to make command line usage easier)
     '''
 
     views = []
-    if view_args is None:
-        view_args = [None for _ in view_names]
+    view_args = _align_view_args(view_names, view_args)
 
     for view_name, view_arg in zip(view_names, view_args):
         if view_name == 'patch_permute':
