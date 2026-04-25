@@ -6,6 +6,188 @@ import torchvision.transforms.functional as TF
 
 from diffusers.utils.torch_utils import randn_tensor
 
+TIME_TRAVEL_START_FRAC = 0.2
+TIME_TRAVEL_END_FRAC = 0.8
+TIME_TRAVEL_REPEATS = 2
+
+
+def _get_execution_device(model, fallback):
+    device = getattr(model, "_execution_device", None)
+    if device is not None:
+        return torch.device(device)
+    if fallback is not None and getattr(fallback, "device", None) is not None:
+        return fallback.device
+    if torch.cuda.is_available():
+        return torch.device('cuda')
+    return torch.device('cpu')
+
+
+def _prediction_type(scheduler):
+    config = getattr(scheduler, "config", None)
+    prediction_type = getattr(config, "prediction_type", None)
+    return 'epsilon' if prediction_type is None else prediction_type
+
+
+def _alpha_terms(scheduler, timestep, sample):
+    alpha_prod_t = scheduler.alphas_cumprod[timestep].to(device=sample.device, dtype=sample.dtype)
+    beta_prod_t = (1 - alpha_prod_t).clamp_min(1e-8)
+    return torch.sqrt(alpha_prod_t), torch.sqrt(beta_prod_t)
+
+
+def _predict_original_sample(scheduler, model_output, sample, timestep):
+    prediction_type = _prediction_type(scheduler)
+    sqrt_alpha_prod_t, sqrt_beta_prod_t = _alpha_terms(scheduler, timestep, sample)
+
+    if prediction_type == 'epsilon':
+        return (sample - sqrt_beta_prod_t * model_output) / sqrt_alpha_prod_t
+    if prediction_type == 'sample':
+        return model_output
+    if prediction_type == 'v_prediction':
+        return sqrt_alpha_prod_t * sample - sqrt_beta_prod_t * model_output
+    raise ValueError(f'Unsupported prediction type: {prediction_type}')
+
+
+def _predict_noise_from_original_sample(scheduler, original_sample, sample, timestep):
+    prediction_type = _prediction_type(scheduler)
+    sqrt_alpha_prod_t, sqrt_beta_prod_t = _alpha_terms(scheduler, timestep, sample)
+
+    if prediction_type == 'epsilon':
+        return (sample - sqrt_alpha_prod_t * original_sample) / sqrt_beta_prod_t
+    if prediction_type == 'sample':
+        return original_sample
+    if prediction_type == 'v_prediction':
+        eps = (sample - sqrt_alpha_prod_t * original_sample) / sqrt_beta_prod_t
+        return sqrt_alpha_prod_t * eps - sqrt_beta_prod_t * original_sample
+    raise ValueError(f'Unsupported prediction type: {prediction_type}')
+
+
+def _inverse_with_mask(view, tensor, clean_sync):
+    if clean_sync:
+        inverted, mask = view.inverse_clean(tensor, return_mask=True)
+        return inverted, mask
+
+    inverted = view.inverse_view(tensor)
+    mask = tensor.new_ones((1, inverted.shape[-2], inverted.shape[-1]))
+    return inverted, mask
+
+
+def _progress(step_idx, total_steps):
+    if total_steps <= 1:
+        return 1.0
+    return step_idx / (total_steps - 1)
+
+
+def _view_weight(view, progress, clean_sync):
+    if not clean_sync:
+        return 1.0
+    return float(view.clean_sync_weight(progress))
+
+
+def _aggregate_inverse_predictions(predictions,
+                                   views,
+                                   reduction,
+                                   step_idx,
+                                   clean_sync,
+                                   progress):
+    if reduction == 'alternate':
+        idx = step_idx % len(views)
+        inverted, _ = _inverse_with_mask(views[idx], predictions[idx], clean_sync)
+        return inverted
+
+    inverted_predictions = []
+    masks = []
+    weights = []
+    for pred, view in zip(predictions, views):
+        inverted, mask = _inverse_with_mask(view, pred, clean_sync)
+        inverted_predictions.append(inverted)
+        masks.append(mask)
+        weights.append(pred.new_full((1, 1, 1), _view_weight(view, progress, clean_sync)))
+
+    inverted_predictions = torch.stack(inverted_predictions)
+    masks = torch.stack(masks)
+    weights = torch.stack(weights)
+    weighted_masks = masks * weights
+
+    if reduction == 'sum':
+        return (inverted_predictions * weighted_masks).sum(0)
+    if reduction != 'mean':
+        raise ValueError('Reduction must be either `mean`, `sum`, or `alternate`')
+
+    weighted = (inverted_predictions * weighted_masks).sum(0)
+    normalizer = weighted_masks.sum(0).clamp_min(1e-6)
+    return weighted / normalizer
+
+
+def _sync_clean_prediction(noisy_images,
+                           viewed_noisy_images,
+                           noise_pred_uncond,
+                           noise_pred_text,
+                           views,
+                           scheduler,
+                           timestep,
+                           guidance_scale,
+                           reduction,
+                           step_idx,
+                           total_steps):
+
+    progress = _progress(step_idx, total_steps)
+
+    sample_channels = noisy_images.shape[1]
+    eps_uncond, _ = noise_pred_uncond.split(sample_channels, dim=1)
+    eps_text, predicted_variance = noise_pred_text.split(sample_channels, dim=1)
+
+    clean_uncond = torch.stack([
+        _predict_original_sample(scheduler, pred, sample, timestep)
+        for pred, sample in zip(eps_uncond, viewed_noisy_images)
+    ])
+    clean_text = torch.stack([
+        _predict_original_sample(scheduler, pred, sample, timestep)
+        for pred, sample in zip(eps_text, viewed_noisy_images)
+    ])
+
+    synced_clean_uncond = _aggregate_inverse_predictions(
+        clean_uncond, views, reduction, step_idx, clean_sync=True, progress=progress
+    )
+    synced_clean_text = _aggregate_inverse_predictions(
+        clean_text, views, reduction, step_idx, clean_sync=True, progress=progress
+    )
+    synced_clean = synced_clean_uncond + guidance_scale * (synced_clean_text - synced_clean_uncond)
+
+    synced_noise = _predict_noise_from_original_sample(
+        scheduler, synced_clean, noisy_images[0], timestep
+    )[None]
+    synced_variance = _aggregate_inverse_predictions(
+        predicted_variance, views, reduction, step_idx, clean_sync=False, progress=progress
+    )[None]
+
+    return torch.cat([synced_noise, synced_variance], dim=1), synced_clean[None]
+
+
+def _time_travel_passes(step_idx,
+                        total_steps,
+                        enabled,
+                        start_frac,
+                        end_frac,
+                        repeats):
+    if not enabled or repeats <= 1:
+        return 1
+
+    progress = _progress(step_idx, total_steps)
+    if start_frac <= progress <= end_frac:
+        return repeats
+    return 1
+
+
+def _renoise_from_clean(scheduler, clean_image, timestep, generator):
+    sqrt_alpha_prod_t, sqrt_beta_prod_t = _alpha_terms(scheduler, timestep, clean_image[0])
+    noise = randn_tensor(
+        clean_image.shape,
+        generator=generator,
+        device=clean_image.device,
+        dtype=clean_image.dtype,
+    )
+    return sqrt_alpha_prod_t * clean_image + sqrt_beta_prod_t * noise
+
 @torch.no_grad()
 def sample_stage_1(model,
                    prompt_embeds,
@@ -15,12 +197,15 @@ def sample_stage_1(model,
                    num_inference_steps=100,
                    guidance_scale=7.0,
                    reduction='mean',
-                   generator=None):
+                   generator=None,
+                   enable_time_travel=True,
+                   time_travel_start=TIME_TRAVEL_START_FRAC,
+                   time_travel_end=TIME_TRAVEL_END_FRAC,
+                   time_travel_repeats=TIME_TRAVEL_REPEATS):
 
     # Params
     num_images_per_prompt = 1
-    #device = model.device
-    device = torch.device('cuda')   # Sometimes model device is cpu???
+    device = _get_execution_device(model, prompt_embeds)
     height = model.unet.config.sample_size
     width = model.unet.config.sample_size
     batch_size = 1      # TODO: Support larger batch sizes, maybe
@@ -51,86 +236,61 @@ def sample_stage_1(model,
         ref_im = TF.resize(ref_im, height)
         ref_im = ref_im.to(noisy_images.device).to(noisy_images.dtype)
 
+    total_steps = len(timesteps)
     for i, t in enumerate(tqdm(timesteps)):
-        # If solving an inverse problem, then project x_t so
-        # that first component matches reference image's first component
-        if ref_im is not None:
-            # Inject noise to reference image
-            alpha_cumprod = model.scheduler.alphas_cumprod[t]
-            ref_noisy = torch.sqrt(alpha_cumprod) * ref_im + \
-                        torch.sqrt(1 - alpha_cumprod) * torch.randn_like(ref_im)
+        passes = _time_travel_passes(
+            i, total_steps, enable_time_travel, time_travel_start, time_travel_end, time_travel_repeats
+        )
+        for pass_idx in range(passes):
+            # If solving an inverse problem, then project x_t so
+            # that first component matches reference image's first component
+            if ref_im is not None:
+                alpha_cumprod = model.scheduler.alphas_cumprod[t]
+                ref_noisy = torch.sqrt(alpha_cumprod) * ref_im + \
+                            torch.sqrt(1 - alpha_cumprod) * torch.randn_like(ref_im)
 
-            # Replace 1st component of x_t with 1st component of noisy ref image
-            ref_noisy_component = views[0].inverse_view(ref_noisy)
-            noisy_images_component = views[1].inverse_view(noisy_images[0])
-            noisy_images = ref_noisy_component + noisy_images_component
+                ref_noisy_component = views[0].inverse_view(ref_noisy)
+                noisy_images_component = views[1].inverse_view(noisy_images[0])
+                noisy_images = (ref_noisy_component + noisy_images_component)[None]
 
-            # Add back batch dim
-            noisy_images = noisy_images[None]
+            viewed_noisy_images = []
+            for view_fn in views:
+                viewed_noisy_images.append(view_fn.view(noisy_images[0]))
+            viewed_noisy_images = torch.stack(viewed_noisy_images)
 
-        # Apply views to noisy_image
-        viewed_noisy_images = []
-        for view_fn in views:
-            viewed_noisy_images.append(view_fn.view(noisy_images[0]))
-        viewed_noisy_images = torch.stack(viewed_noisy_images)
+            model_input = torch.cat([viewed_noisy_images] * 2)
+            model_input = model.scheduler.scale_model_input(model_input, t)
 
-        # Duplicate inputs for CFG
-        # Model input is: [ neg_0, neg_1, ..., pos_0, pos_1, ... ]
-        model_input = torch.cat([viewed_noisy_images] * 2)
-        model_input = model.scheduler.scale_model_input(model_input, t)
+            noise_pred = model.unet(
+                model_input,
+                t,
+                encoder_hidden_states=prompt_embeds,
+                cross_attention_kwargs=None,
+                return_dict=False,
+            )[0]
 
-        # Predict noise estimate
-        noise_pred = model.unet(
-            model_input,
-            t,
-            encoder_hidden_states=prompt_embeds,
-            cross_attention_kwargs=None,
-            return_dict=False,
-        )[0]
+            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+            noise_pred, synced_clean = _sync_clean_prediction(
+                noisy_images,
+                viewed_noisy_images,
+                noise_pred_uncond,
+                noise_pred_text,
+                views,
+                model.scheduler,
+                t,
+                guidance_scale,
+                reduction,
+                i,
+                total_steps,
+            )
 
-        # Extract uncond (neg) and cond noise estimates
-        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-
-        # Invert the unconditional (negative) estimates
-        inverted_preds = []
-        for pred, view in zip(noise_pred_uncond, views):
-            inverted_pred = view.inverse_view(pred)
-            inverted_preds.append(inverted_pred)
-        noise_pred_uncond = torch.stack(inverted_preds)
-
-        # Invert the conditional estimates
-        inverted_preds = []
-        for pred, view in zip(noise_pred_text, views):
-            inverted_pred = view.inverse_view(pred)
-            inverted_preds.append(inverted_pred)
-        noise_pred_text = torch.stack(inverted_preds)
-
-        # Split into noise estimate and variance estimates
-        noise_pred_uncond, _ = noise_pred_uncond.split(model_input.shape[1], dim=1)
-        noise_pred_text, predicted_variance = noise_pred_text.split(model_input.shape[1], dim=1)
-        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-
-        # Reduce predicted noise and variances
-        noise_pred = noise_pred.view(-1,num_prompts,3,64,64)
-        predicted_variance = predicted_variance.view(-1,num_prompts,3,64,64)
-        if reduction == 'mean':
-            noise_pred = noise_pred.mean(1)
-            predicted_variance = predicted_variance.mean(1)
-        elif reduction == 'sum':
-            # For factorized diffusion
-            noise_pred = noise_pred.sum(1)
-            predicted_variance = predicted_variance.mean(1)
-        elif reduction == 'alternate':
-            noise_pred = noise_pred[:,i%num_prompts]
-            predicted_variance = predicted_variance[:,i%num_prompts]
-        else:
-            raise ValueError('Reduction must be either `mean` or `alternate`')
-        noise_pred = torch.cat([noise_pred, predicted_variance], dim=1)
-
-        # compute the previous noisy sample x_t -> x_t-1
-        noisy_images = model.scheduler.step(
-            noise_pred, t, noisy_images, generator=generator, return_dict=False
-        )[0]
+            next_noisy_images = model.scheduler.step(
+                noise_pred, t, noisy_images, generator=generator, return_dict=False
+            )[0]
+            if pass_idx + 1 < passes:
+                noisy_images = _renoise_from_clean(model.scheduler, synced_clean, t, generator)
+            else:
+                noisy_images = next_noisy_images
 
     # Return denoised images
     return noisy_images
@@ -152,14 +312,18 @@ def sample_stage_2(model,
                    guidance_scale=7.0,
                    reduction='mean',
                    noise_level=50,
-                   generator=None):
+                   generator=None,
+                   enable_time_travel=True,
+                   time_travel_start=TIME_TRAVEL_START_FRAC,
+                   time_travel_end=TIME_TRAVEL_END_FRAC,
+                   time_travel_repeats=TIME_TRAVEL_REPEATS):
 
     # Params
     batch_size = 1      # TODO: Support larger batch sizes, maybe
     num_prompts = prompt_embeds.shape[0]
     height = model.unet.config.sample_size
     width = model.unet.config.sample_size
-    device = model.device
+    device = _get_execution_device(model, prompt_embeds)
     num_images_per_prompt = 1
 
     # For CFG
@@ -197,90 +361,63 @@ def sample_stage_2(model,
     noise_level = torch.cat([noise_level] * num_prompts * 2)
 
     # Denoising Loop
+    total_steps = len(timesteps)
     for i, t in enumerate(tqdm(timesteps)):
-        # If solving an inverse problem, then project x_t so
-        # that first component matches reference image's first component
-        if ref_im is not None:
-            # Inject noise to reference image
-            alpha_cumprod = model.scheduler.alphas_cumprod[t]
-            ref_noisy = torch.sqrt(alpha_cumprod) * ref_im + \
-                        torch.sqrt(1 - alpha_cumprod) * torch.randn_like(ref_im)
+        passes = _time_travel_passes(
+            i, total_steps, enable_time_travel, time_travel_start, time_travel_end, time_travel_repeats
+        )
+        for pass_idx in range(passes):
+            if ref_im is not None:
+                alpha_cumprod = model.scheduler.alphas_cumprod[t]
+                ref_noisy = torch.sqrt(alpha_cumprod) * ref_im + \
+                            torch.sqrt(1 - alpha_cumprod) * torch.randn_like(ref_im)
 
-            # Replace 1st component of x_t with 1st component of noisy ref image
-            ref_noisy_component = views[0].inverse_view(ref_noisy)
-            noisy_images_component = views[1].inverse_view(noisy_images[0])
-            noisy_images = ref_noisy_component + noisy_images_component
+                ref_noisy_component = views[0].inverse_view(ref_noisy)
+                noisy_images_component = views[1].inverse_view(noisy_images[0])
+                noisy_images = (ref_noisy_component + noisy_images_component)[None]
 
-            # Add back batch dim
-            noisy_images = noisy_images[None]
+            model_input = torch.cat([noisy_images, upscaled], dim=1)
 
-        # Cat noisy image with upscaled conditioning image
-        model_input = torch.cat([noisy_images, upscaled], dim=1)
+            viewed_inputs = []
+            for view_fn in views:
+                viewed_inputs.append(view_fn.view(model_input[0]))
+            viewed_inputs = torch.stack(viewed_inputs)
+            viewed_noisy_images = viewed_inputs[:, :num_channels]
 
-        # Apply views to noisy_image
-        viewed_inputs = []
-        for view_fn in views:
-            viewed_inputs.append(view_fn.view(model_input[0]))
-        viewed_inputs = torch.stack(viewed_inputs)
+            model_input = torch.cat([viewed_inputs] * 2)
+            model_input = model.scheduler.scale_model_input(model_input, t)
 
-        # Duplicate inputs for CFG
-        # Model input is: [ neg_0, neg_1, ..., pos_0, pos_1, ... ]
-        model_input = torch.cat([viewed_inputs] * 2)
-        model_input = model.scheduler.scale_model_input(model_input, t)
+            noise_pred = model.unet(
+                model_input,
+                t,
+                encoder_hidden_states=prompt_embeds,
+                class_labels=noise_level,
+                cross_attention_kwargs=None,
+                return_dict=False,
+            )[0]
 
-        # predict the noise residual
-        noise_pred = model.unet(
-            model_input,
-            t,
-            encoder_hidden_states=prompt_embeds,
-            class_labels=noise_level,
-            cross_attention_kwargs=None,
-            return_dict=False,
-        )[0]
+            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+            noise_pred, synced_clean = _sync_clean_prediction(
+                noisy_images,
+                viewed_noisy_images,
+                noise_pred_uncond,
+                noise_pred_text,
+                views,
+                model.scheduler,
+                t,
+                guidance_scale,
+                reduction,
+                i,
+                total_steps,
+            )
 
-        # Extract uncond (neg) and cond noise estimates
-        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-
-        # Invert the unconditional (negative) estimates
-        # TODO: pretty sure you can combine these into one loop
-        inverted_preds = []
-        for pred, view in zip(noise_pred_uncond, views):
-            inverted_pred = view.inverse_view(pred)
-            inverted_preds.append(inverted_pred)
-        noise_pred_uncond = torch.stack(inverted_preds)
-
-        # Invert the conditional estimates
-        inverted_preds = []
-        for pred, view in zip(noise_pred_text, views):
-            inverted_pred = view.inverse_view(pred)
-            inverted_preds.append(inverted_pred)
-        noise_pred_text = torch.stack(inverted_preds)
-
-        # Split predicted noise and predicted variances
-        noise_pred_uncond, _ = noise_pred_uncond.split(model_input.shape[1] // 2, dim=1)
-        noise_pred_text, predicted_variance = noise_pred_text.split(model_input.shape[1] // 2, dim=1)
-        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-
-        # Combine noise estimates (and variance estimates)
-        noise_pred = noise_pred.view(-1,num_prompts,3,256,256)
-        predicted_variance = predicted_variance.view(-1,num_prompts,3,256,256)
-        if reduction == 'mean':
-            noise_pred = noise_pred.mean(1)
-            predicted_variance = predicted_variance.mean(1)
-        elif reduction == 'sum':
-            # For factorized diffusion
-            noise_pred = noise_pred.sum(1)
-            predicted_variance = predicted_variance.mean(1)
-        elif reduction == 'alternate':
-            noise_pred = noise_pred[:,i%num_prompts]
-            predicted_variance = predicted_variance[:,i%num_prompts]
-
-        noise_pred = torch.cat([noise_pred, predicted_variance], dim=1)
-
-        # compute the previous noisy sample x_t -> x_t-1
-        noisy_images = model.scheduler.step(
-            noise_pred, t, noisy_images, generator=generator, return_dict=False
-        )[0]
+            next_noisy_images = model.scheduler.step(
+                noise_pred, t, noisy_images, generator=generator, return_dict=False
+            )[0]
+            if pass_idx + 1 < passes:
+                noisy_images = _renoise_from_clean(model.scheduler, synced_clean, t, generator)
+            else:
+                noisy_images = next_noisy_images
 
     # Return denoised images
     return noisy_images
