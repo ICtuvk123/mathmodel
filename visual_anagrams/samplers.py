@@ -61,6 +61,21 @@ def _predict_noise_from_original_sample(scheduler, original_sample, sample, time
     raise ValueError(f'Unsupported prediction type: {prediction_type}')
 
 
+def _stabilize_clean_sample(scheduler, clean_sample):
+    config = getattr(scheduler, "config", None)
+    if config is None:
+        return clean_sample.clamp(-1.0, 1.0)
+
+    if getattr(config, "thresholding", False) and hasattr(scheduler, "_threshold_sample"):
+        return scheduler._threshold_sample(clean_sample)
+
+    if getattr(config, "clip_sample", True):
+        clip_sample_range = float(getattr(config, "clip_sample_range", 1.0))
+        return clean_sample.clamp(-clip_sample_range, clip_sample_range)
+
+    return clean_sample
+
+
 def _inverse_with_mask(view, tensor, clean_sync):
     if clean_sync:
         inverted, mask = view.inverse_clean(tensor, return_mask=True)
@@ -152,6 +167,7 @@ def _sync_clean_prediction(noisy_images,
         clean_text, views, reduction, step_idx, clean_sync=True, progress=progress
     )
     synced_clean = synced_clean_uncond + guidance_scale * (synced_clean_text - synced_clean_uncond)
+    synced_clean = _stabilize_clean_sample(scheduler, synced_clean)
 
     synced_noise = _predict_noise_from_original_sample(
         scheduler, synced_clean, noisy_images[0], timestep
@@ -179,6 +195,7 @@ def _time_travel_passes(step_idx,
 
 
 def _renoise_from_clean(scheduler, clean_image, timestep, generator):
+    clean_image = _stabilize_clean_sample(scheduler, clean_image)
     sqrt_alpha_prod_t, sqrt_beta_prod_t = _alpha_terms(scheduler, timestep, clean_image[0])
     noise = randn_tensor(
         clean_image.shape,
