@@ -8,7 +8,7 @@ from diffusers.utils.torch_utils import randn_tensor
 
 TIME_TRAVEL_START_FRAC = 0.2
 TIME_TRAVEL_END_FRAC = 0.8
-TIME_TRAVEL_REPEATS = 2
+TIME_TRAVEL_REPEATS = 1
 
 
 def _get_execution_device(model, fallback):
